@@ -24,8 +24,3 @@ A sophisticated multi-agent system using LangGraph for adaptive antenna array op
 5. **Deployment**: Save optimized configuration
 6. **Monitoring**: Continuous DOA drift and performance monitoring
 
-## Re-optimization Triggers
-
-The system automatically triggers re-optimization when:
-- **DOA Drift**: `max_drift > 3.0°`
-- **Performance Degradation**: `movable_gain < fixed_gain`

@@ -1,0 +1,205 @@
+import numpy as np
+from typing import List, Dict, Tuple
+
+
+# ==============================================================================
+# 核心工具函数
+# ==============================================================================
+
+def steering_vector_lambda(
+        positions_lambda: np.ndarray,
+        angles_deg: np.ndarray,
+) -> np.ndarray:
+    """
+    计算给定角度的导向矢量/矩阵。
+    - positions_lambda: (N,) 阵元位置
+    - angles_deg: (K,) 角度（度）
+    - 返回: (N, K) 导向矩阵
+    """
+    x = np.asarray(positions_lambda, dtype=float).reshape(-1)
+    th = np.deg2rad(np.asarray(angles_deg, dtype=float))
+    psi = np.sin(th)
+    return np.exp(1j * 2 * np.pi * np.outer(x, psi))
+
+
+# ==============================================================================
+# 模块1: CSI 生成函数
+# ==============================================================================
+
+def generate_csi(
+        positions_lambda: np.ndarray,
+        true_doas: List[float],
+        T: int,
+        noise_power_watts: float,
+        rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    根据天线阵列位置和 K 个UAV的真实DOA，生成CSI矩阵。
+
+    Args:
+        positions_lambda (np.ndarray): (N,) 阵元位置 (单位: 波长)
+        true_doas (List[float]): 包含 K 个UAV真实DOA的角度列表
+        T (int): 快拍数
+        noise_power_watts (float): 噪声功率
+        rng (np.random.Generator): 随机数生成器
+
+    Returns:
+        np.ndarray: N x T 的带噪声观测矩阵 Y。
+    """
+    N = len(positions_lambda)
+    K = len(true_doas)
+    A_true = steering_vector_lambda(positions_lambda, np.array(true_doas))
+    S = (rng.standard_normal((K, T)) + 1j * rng.standard_normal((K, T))) / np.sqrt(2)
+    X_clean = A_true @ S
+    noise_amplitude = np.sqrt(noise_power_watts / 2)
+    noise = noise_amplitude * (rng.standard_normal((N, T)) + 1j * rng.standard_normal((N, T)))
+    Y_observed = X_clean + noise
+    return Y_observed
+
+
+# ==============================================================================
+# 模块2: DOA 估计算数 (MUSIC)
+# ==============================================================================
+
+def estimate_doas_music(
+        Y: np.ndarray,
+        positions_lambda: np.ndarray,
+        K: int,
+        grid_res_deg: float = 0.5,
+        peak_separation_deg: float = 5.0,
+) -> List[float]:
+    """
+    使用MUSIC算法从观测数据Y中估计K个信号源的DOA。
+
+    Args:
+        Y (np.ndarray): N x T 的观测矩阵
+        positions_lambda (np.ndarray): (N,) 阵元位置
+        K (int): 要寻找的信号源数量
+
+    Returns:
+        List[float]: 估计出的 K 个DOA角度列表，按从小到大排序。
+    """
+    N, T = Y.shape
+    if K <= 0 or K >= N: raise ValueError(f"信号源数量 K={K} 必须在 1 到 N-1={N - 1} 之间")
+    R = (Y @ Y.conj().T) / T
+    _, eigvecs = np.linalg.eigh(R)
+    En = eigvecs[:, :N - K]
+    angles_grid = np.arange(-90, 90 + 1e-9, grid_res_deg)
+    A = steering_vector_lambda(positions_lambda, angles_grid)
+    EnH_A = En.conj().T @ A
+    denom = np.sum(np.abs(EnH_A) ** 2, axis=0).real
+    P_music = 1.0 / np.maximum(denom, 1e-12)
+    idx_sorted = np.argsort(P_music)[::-1]
+    chosen_doas: List[float] = []
+    for idx in idx_sorted:
+        angle_candidate = angles_grid[idx]
+        is_far_enough = all(abs(angle_candidate - doa) >= peak_separation_deg for doa in chosen_doas)
+        if is_far_enough:
+            chosen_doas.append(angle_candidate)
+            if len(chosen_doas) == K:
+                break
+    return sorted(chosen_doas)
+
+
+# ==============================================================================
+# 模块3: 波束赋形权重计算
+# ==============================================================================
+
+def calculate_mrc_weights(
+        positions_lambda: np.ndarray,
+        estimated_doas: List[float],
+) -> Dict[float, np.ndarray]:
+    """
+    为每个估计出的DOA计算最大比合并(MRC)波束赋形权重。
+
+    Args:
+        positions_lambda (np.ndarray): (N,) 阵元位置
+        estimated_doas (List[float]): K 个估计出的DOA角度
+
+    Returns:
+        Dict[float, np.ndarray]: 一个字典，key是DOA角度，value是对应的(N,1)权重向量。
+    """
+    weights_dict = {}
+    for doa in estimated_doas:
+        steering_vec = steering_vector_lambda(positions_lambda, np.array([doa]))
+        w = steering_vec.conj() / np.linalg.norm(steering_vec)
+        weights_dict[doa] = w
+    return weights_dict
+
+
+# ==============================================================================
+# 模块4: 性能评估 (计算总输出功率)
+# ==============================================================================
+
+def calculate_beamforming_power(
+        weights: np.ndarray,
+        Y_observed: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    使用给定的波束权重，计算总输出信号的平均功率。
+    这个函数更贴近实际，因为它只依赖于可观测的 Y。
+
+    Args:
+        weights (np.ndarray): (N,1) 的波束赋形权重向量
+        Y_observed (np.ndarray): N x T 的带噪声总观测矩阵
+
+    Returns:
+        Tuple[float, float]:
+            - power_watts (float): 输出功率，单位是瓦特 (W)。
+            - power_dbw (float): 输出功率，单位是分贝瓦 (dBW)。
+    """
+    # 对观测信号Y应用波束赋形
+    z_output = weights.T @ Y_observed
+
+    # 计算平均功率
+    power_watts = float(np.mean(np.abs(z_output) ** 2))
+
+    # 转换为dBW (10 * log10(Power/1W))
+    if power_watts < 1e-12:
+        power_dbw = -np.inf
+    else:
+        power_dbw = 10 * np.log10(power_watts)
+
+    return power_watts, power_dbw
+
+
+# ==============================================================================
+# 使用示例: 演示如何独立调用这些函数
+# ==============================================================================
+
+if __name__ == "__main__":
+    # --- 1. 初始化参数 ---
+    rng = np.random.default_rng(seed=20)
+    positions_lambda = np.arange(12) * 0.5  # 12元半波长均匀线阵
+    T = 500
+    noise_power_watts = 0.05
+
+    # 假设当前有 K=3 个UAV
+    true_doas_k3 = [-45.0, -10.5, 22.8]
+    K = len(true_doas_k3)
+
+    print(f"--- 场景: K={K}个UAV, 真实DOAs: {true_doas_k3} ---")
+
+    # --- 2. 调用模块1: 生成观测数据 ---
+    print("\n1. 生成CSI观测数据...")
+    Y = generate_csi(positions_lambda, true_doas_k3, T, noise_power_watts, rng)
+    print(f"   生成 Y 矩阵，形状: {Y.shape}")
+
+    # --- 3. 调用模块2: 估计DOA ---
+    print("\n2. 使用MUSIC估计算法...")
+    estimated_doas = estimate_doas_music(Y, positions_lambda, K=K)
+    print(f"   估计出的DOAs: {[round(d, 2) for d in estimated_doas]}")
+
+    # --- 4. 调用模块3: 计算波束权重 ---
+    print("\n3. 为每个估计出的DOA计算MRC权重...")
+    weights_map = calculate_mrc_weights(positions_lambda, estimated_doas)
+    for doa, w in weights_map.items():
+        print(f"   为 DOA={round(doa, 2)}° 计算了权重，形状: {w.shape}")
+
+    # --- 5. 调用模块4: 评估每个波束的总输出功率 ---
+    print("\n4. 评估每个波束的输出功率...")
+    for doa, weights in weights_map.items():
+        # **修正点**: 直接传递权重向量，不要在这里进行转置
+        power_w, power_dbw = calculate_beamforming_power(weights, Y)
+        print(weights)
+        print(f"   指向 {round(doa, 2)}° 的波束，输出功率: {power_w:.4f} W ({power_dbw:.2f} dBW)")
